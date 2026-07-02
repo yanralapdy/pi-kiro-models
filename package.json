@@ -1,0 +1,34 @@
+{
+  "name": "pi-kiro-models",
+  "description": "Bridge Kiro CLI's 15 premium AI models into the pi coding agent via Agent Client Protocol (ACP).",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "license": "MIT",
+  "author": "tnkapdy",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tnkapdy/pi-kiro-models.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tnkapdy/pi-kiro-models/issues"
+  },
+  "homepage": "https://github.com/tnkapdy/pi-kiro-models#readme",
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "kiro",
+    "kiro-cli",
+    "acp",
+    "agent-client-protocol",
+    "ai",
+    "coding-agent",
+    "model-provider",
+    "extension"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}
