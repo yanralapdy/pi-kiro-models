@@ -5,15 +5,15 @@
   "version": "0.1.0",
   "type": "module",
   "license": "MIT",
-  "author": "tnkapdy",
+  "author": "yanralapdy",
   "repository": {
     "type": "git",
-    "url": "https://github.com/tnkapdy/pi-kiro-models.git"
+    "url": "https://github.com/yanralapdy/pi-kiro-models.git"
   },
   "bugs": {
-    "url": "https://github.com/tnkapdy/pi-kiro-models/issues"
+    "url": "https://github.com/yanralapdy/pi-kiro-models/issues"
   },
-  "homepage": "https://github.com/tnkapdy/pi-kiro-models#readme",
+  "homepage": "https://github.com/yanralapdy/pi-kiro-models#readme",
   "keywords": [
     "pi",
     "pi-coding-agent",
