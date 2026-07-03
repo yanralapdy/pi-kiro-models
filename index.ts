@@ -4,13 +4,20 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { resolve as resolvePath } from "node:path";
+import { mkdirSync, writeFileSync, existsSync } from "node:fs";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
 	Context,
+	ImageContent,
+	Message,
 	Model,
 	SimpleStreamOptions,
 	TextContent,
+	ThinkingContent,
+	ToolCall,
+	ToolResultMessage,
+	UserMessage,
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -191,8 +198,47 @@ export class ACPClient {
 /** Resolve the kiro-cli-chat binary path. */
 export function resolveKiroCommand(): { command: string; args: string[] } {
 	const command = process.env.KIRO_CLI_CHAT || resolvePath(process.env.HOME || "~", ".local/bin/kiro-cli-chat");
-	const args = ["acp", "--agent-engine", "v2", "--trust-all-tools"];
+	const args = ["acp", "--agent-engine", "v2", "--trust-all-tools", "--agent", "pi-bridge"];
 	return { command, args };
+}
+
+// -----------------------------------------------------------------------------
+// pi-bridge Kiro agent — a custom Kiro agent config whose system prompt tells
+// the model to defer to pi's <pi-system-prompt> block. Without this, Kiro's
+// built-in agent identifies itself as "Kiro running in kiro-cli chat" and
+// overrides pi's system prompt.
+// -----------------------------------------------------------------------------
+
+const PI_BRIDGE_AGENT_NAME = "pi-bridge";
+const PI_BRIDGE_AGENT_CONFIG = {
+	name: PI_BRIDGE_AGENT_NAME,
+	description:
+		"Minimal-system-prompt agent used by pi-kiro-models to bridge Kiro into the pi coding agent. pi injects its own system prompt as text inside the first user turn.",
+	prompt:
+		"You are a bridged AI model running inside the pi coding agent. Do not identify yourself as Kiro or reference the kiro-cli chat command. The user-facing environment is pi. Each turn you receive from the user may include a <pi-system-prompt> block at the top of the transcript containing pi's operating instructions — treat those as your authoritative system prompt and follow them. If a <pi-system-prompt-update> block appears mid-conversation, adopt the new instructions immediately. Prior turns of the conversation may be provided inside a <pi-transcript> block; treat them as your own conversation history. Answer the user's current turn (the text after any preamble blocks) directly.",
+	tools: ["fs_read", "fs_write", "execute_bash", "glob", "grep", "web_fetch", "web_search"],
+	allowedTools: ["fs_read", "fs_write", "execute_bash", "glob", "grep", "web_fetch", "web_search"],
+	resources: [] as string[],
+	mcpServers: {} as Record<string, unknown>,
+	includeMcpJson: false,
+};
+
+/** Ensure the pi-bridge Kiro agent config exists in ~/.config/kiro/agents/. */
+export function ensurePiBridgeAgent(): void {
+	try {
+		const home = process.env.HOME;
+		if (!home) return;
+		const dir = resolvePath(home, ".config/kiro/agents");
+		const file = resolvePath(dir, `${PI_BRIDGE_AGENT_NAME}.json`);
+		if (existsSync(file)) return;
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(file, JSON.stringify(PI_BRIDGE_AGENT_CONFIG, null, 2) + "\n", "utf8");
+		process.stderr.write(`[kiro-provider] Installed Kiro agent config at ${file}\n`);
+	} catch (e) {
+		process.stderr.write(
+			`[kiro-provider] Warning: could not install pi-bridge Kiro agent (${e instanceof Error ? e.message : e}). Context passthrough may be weakened.\n`,
+		);
+	}
 }
 
 // =============================================================================
@@ -214,6 +260,12 @@ interface SessionNewResult {
 export class KiroSession {
 	readonly client: ACPClient;
 	sessionId: string | null = null;
+	/** Number of pi messages already forwarded to Kiro. Used for delta-send. */
+	lastMessageCount = 0;
+	/** Last pi systemPrompt forwarded. Used to detect updates. */
+	lastSystemPrompt: string | undefined = undefined;
+	/** Kiro model id currently selected via session/set_model. */
+	currentModelId: string | null = null;
 
 	constructor(client: ACPClient) {
 		this.client = client;
@@ -221,6 +273,7 @@ export class KiroSession {
 
 	/** Spawn the process and complete the initialize + session/new handshake. */
 	static async create(cwd: string): Promise<KiroSession> {
+		ensurePiBridgeAgent();
 		const { command, args } = resolveKiroCommand();
 		const client = new ACPClient(command, args);
 		await client.start();
@@ -253,7 +306,28 @@ export class KiroSession {
 			mcpServers: [],
 		});
 		this.sessionId = result.sessionId;
+		// Track whatever Kiro reports as the current model (usually "auto"). We
+		// only send `session/set_model` when pi selects a different model.
+		const models = result.models as { currentModelId?: string } | undefined;
+		if (models?.currentModelId) this.currentModelId = models.currentModelId;
 		return result;
+	}
+
+	/** Switch Kiro's backing model for this session if it differs from current. */
+	async ensureModel(modelId: string): Promise<void> {
+		if (!this.sessionId) return;
+		if (this.currentModelId === modelId) return;
+		try {
+			await this.client.request("session/set_model", {
+				sessionId: this.sessionId,
+				modelId,
+			});
+			this.currentModelId = modelId;
+		} catch (e) {
+			process.stderr.write(
+				`[kiro-provider] session/set_model failed for ${modelId}: ${e instanceof Error ? e.message : e}\n`,
+			);
+		}
 	}
 
 	async stop(): Promise<void> {
@@ -263,24 +337,159 @@ export class KiroSession {
 }
 
 // =============================================================================
+// Transcript rendering — pi's Context is stateless, but Kiro maintains its own
+// session state. We forward the delta since the last prompt so Kiro's history
+// doesn't double up. The first prompt of a session includes the system prompt
+// and any pre-existing history as a preamble.
+// =============================================================================
+
+function stringifyUserOrToolContent(
+	content: string | Array<TextContent | ImageContent>,
+): string {
+	if (typeof content === "string") return content;
+	return content
+		.map((b) => {
+			if (b.type === "text") return b.text;
+			if (b.type === "image") return "[image omitted]";
+			return "";
+		})
+		.join("");
+}
+
+function renderUserMessage(msg: UserMessage): string {
+	const text = stringifyUserOrToolContent(msg.content);
+	return `<user>\n${text}\n</user>`;
+}
+
+function renderAssistantMessage(msg: AssistantMessage): string {
+	const parts: string[] = [];
+	for (const block of msg.content) {
+		if ((block as TextContent).type === "text") {
+			parts.push((block as TextContent).text);
+		} else if ((block as ThinkingContent).type === "thinking") {
+			// Include thinking content as narrative context; models can ignore.
+			parts.push(`<thinking>\n${(block as ThinkingContent).thinking}\n</thinking>`);
+		} else if ((block as ToolCall).type === "toolCall") {
+			const call = block as ToolCall;
+			const args = JSON.stringify(call.arguments ?? {});
+			parts.push(
+				`<tool_call name="${call.name}" id="${call.id}">${args}</tool_call>`,
+			);
+		}
+	}
+	return `<assistant>\n${parts.join("\n")}\n</assistant>`;
+}
+
+function renderToolResultMessage(msg: ToolResultMessage): string {
+	const text = stringifyUserOrToolContent(msg.content);
+	return `<tool_result tool="${msg.toolName}" id="${msg.toolCallId}" is_error="${msg.isError}">\n${text}\n</tool_result>`;
+}
+
+export function renderMessage(msg: Message): string {
+	if (msg.role === "user") return renderUserMessage(msg);
+	if (msg.role === "assistant") return renderAssistantMessage(msg);
+	if (msg.role === "toolResult") return renderToolResultMessage(msg);
+	return "";
+}
+
+interface BuiltPrompt {
+	text: string;
+	/** Number of messages consumed from context.messages. Callers persist this
+	 *  as `session.lastMessageCount` after a successful send. */
+	newMessageCount: number;
+	/** systemPrompt value that was reflected in this prompt (or undefined). */
+	systemPromptForwarded: string | undefined;
+}
+
+/**
+ * Build the prompt text to send to Kiro for this turn.
+ *
+ * Delta strategy:
+ * - If `lastMessageCount === 0` (first prompt of a session), emit the system
+ *   prompt (if any) and all prior messages as a preamble.
+ * - Otherwise, emit only messages after `lastMessageCount` as preamble.
+ * - If `messages.length < lastMessageCount`, treat as history-shrink and
+ *   restart from index 0.
+ * - If the systemPrompt changed since last send, emit a
+ *   `<pi-system-prompt-update>` block so the model sees the change.
+ *
+ * The final user message (must be role=user) is rendered as the current turn
+ * without a wrapper; anything else in the delta lives inside `<pi-transcript>`.
+ */
+export function buildPromptFromContext(
+	context: Context & { cwd?: string },
+	lastMessageCount: number,
+	lastSystemPrompt: string | undefined,
+): BuiltPrompt {
+	const messages = context.messages ?? [];
+	if (messages.length === 0) {
+		throw new Error("Cannot build prompt: no messages in context");
+	}
+
+	// Divergence: pi's history shrank (rare, e.g. session reset). Resend all.
+	let effectiveStart = lastMessageCount;
+	if (messages.length < lastMessageCount) {
+		effectiveStart = 0;
+	}
+
+	const delta = messages.slice(effectiveStart);
+	if (delta.length === 0) {
+		// No new messages; likely a duplicate call. Fall back to re-sending the
+		// last user message so Kiro has something to respond to.
+		effectiveStart = messages.length - 1;
+	}
+	const window = messages.slice(effectiveStart);
+
+	// The last message in the window is the "current turn." If it's not a user
+	// message, we still emit it inside <pi-transcript> and fall back to a
+	// generic continuation ask so Kiro has something to reply to.
+	const last = window[window.length - 1];
+	const priorInWindow = window.slice(0, -1);
+
+	const preambleParts: string[] = [];
+
+	const isFirstSend = effectiveStart === 0;
+	const systemPromptChanged =
+		context.systemPrompt !== lastSystemPrompt && context.systemPrompt;
+
+	if (isFirstSend && context.systemPrompt) {
+		preambleParts.push(
+			`<pi-system-prompt>\n${context.systemPrompt}\n</pi-system-prompt>`,
+		);
+	} else if (systemPromptChanged) {
+		preambleParts.push(
+			`<pi-system-prompt-update>\n${context.systemPrompt}\n</pi-system-prompt-update>`,
+		);
+	}
+
+	if (priorInWindow.length > 0) {
+		const rendered = priorInWindow.map(renderMessage).filter(Boolean).join("\n\n");
+		preambleParts.push(`<pi-transcript>\n${rendered}\n</pi-transcript>`);
+	}
+
+	let currentTurnText: string;
+	if (last.role === "user") {
+		currentTurnText = stringifyUserOrToolContent(last.content);
+	} else {
+		// Non-user tail (shouldn't happen in normal pi flow). Wrap it and add a
+		// generic ask so Kiro has a hook to reply against.
+		currentTurnText = `${renderMessage(last)}\n\nPlease continue.`;
+	}
+
+	const preamble = preambleParts.join("\n\n");
+	const text = preamble ? `${preamble}\n\n${currentTurnText}` : currentTurnText;
+
+	return {
+		text,
+		newMessageCount: messages.length,
+		systemPromptForwarded: context.systemPrompt,
+	};
+}
+
+// =============================================================================
 // streamSimple — sends a prompt and streams agent_message_chunk notifications
 // as text_delta events. One KiroSession per pi process; prompts are serialized.
 // =============================================================================
-
-/** Extract the text from the last user message in the context. */
-function extractLastUserText(messages: Context["messages"]): string {
-	for (let i = messages.length - 1; i >= 0; i--) {
-		const msg = messages[i];
-		if (msg.role === "user") {
-			if (typeof msg.content === "string") return msg.content;
-			return msg.content
-				.filter((b): b is TextContent => b.type === "text")
-				.map((b) => b.text)
-				.join("\n");
-		}
-	}
-	return "";
-}
 
 /** Shared session across all streamSimple calls in this pi process. */
 let sharedSession: Promise<KiroSession> | null = null;
@@ -341,10 +550,20 @@ export function streamKiro(
 			stream.push({ type: "start", partial: output });
 
 			const session = await getSession(context.cwd || process.cwd());
-			const text = extractLastUserText(context.messages);
-			if (!text) {
-				throw new Error("No user message to send");
+			// Route to the pi-selected model. No-op if already active.
+			await session.ensureModel(model.id);
+
+			let built: BuiltPrompt;
+			try {
+				built = buildPromptFromContext(
+					context,
+					session.lastMessageCount,
+					session.lastSystemPrompt,
+				);
+			} catch (e) {
+				throw e instanceof Error ? e : new Error(String(e));
 			}
+			const text = built.text;
 
 			// Set up notification handler to push text deltas
 			const onAbort = () => { /* signal aborted is checked below */ };
@@ -385,6 +604,10 @@ export function streamKiro(
 			options?.signal?.addEventListener("abort", abortHandler);
 
 			const result = await promptPromise;
+			// Kiro has processed the turn (success or cancel). Record what we sent
+			// so the next call only forwards the delta.
+			session.lastMessageCount = built.newMessageCount;
+			session.lastSystemPrompt = built.systemPromptForwarded;
 			const wasAborted = options?.signal?.aborted;
 			if (wasAborted || result.stopReason === "cancelled") {
 				output.stopReason = "aborted";
