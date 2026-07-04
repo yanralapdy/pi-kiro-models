@@ -146,7 +146,7 @@ All 15 models from the Kiro catalog:
 
 ```bash
 cd ~/.pi/agent/extensions/
-git clone https://github.com/tnkapdy/pi-kiro-models.git kiro-provider
+git clone https://github.com/yanralapdy/pi-kiro-models.git kiro-provider
 ```
 
 ### Method 2: Symlink from a dev location
