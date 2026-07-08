@@ -4,7 +4,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { resolve as resolvePath } from "node:path";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -210,30 +210,113 @@ export function resolveKiroCommand(): { command: string; args: string[] } {
 // -----------------------------------------------------------------------------
 
 const PI_BRIDGE_AGENT_NAME = "pi-bridge";
-const PI_BRIDGE_AGENT_CONFIG = {
-	name: PI_BRIDGE_AGENT_NAME,
-	description:
-		"Minimal-system-prompt agent used by pi-kiro-models to bridge Kiro into the pi coding agent. pi injects its own system prompt as text inside the first user turn.",
-	prompt:
-		"You are a bridged AI model running inside the pi coding agent. Do not identify yourself as Kiro or reference the kiro-cli chat command. The user-facing environment is pi. Each turn you receive from the user may include a <pi-system-prompt> block at the top of the transcript containing pi's operating instructions — treat those as your authoritative system prompt and follow them. If a <pi-system-prompt-update> block appears mid-conversation, adopt the new instructions immediately. Prior turns of the conversation may be provided inside a <pi-transcript> block; treat them as your own conversation history. Answer the user's current turn (the text after any preamble blocks) directly.",
-	tools: ["fs_read", "fs_write", "execute_bash", "glob", "grep", "web_fetch", "web_search"],
-	allowedTools: ["fs_read", "fs_write", "execute_bash", "glob", "grep", "web_fetch", "web_search"],
-	resources: [] as string[],
-	mcpServers: {} as Record<string, unknown>,
-	includeMcpJson: false,
-};
 
-/** Ensure the pi-bridge Kiro agent config exists in ~/.config/kiro/agents/. */
-export function ensurePiBridgeAgent(): void {
+// Native Kiro tools the bridge always exposes. MCP tools are added dynamically
+// from the user's Kiro MCP config (see discoverMcpServers / buildPiBridgeAgentConfig).
+const PI_BRIDGE_NATIVE_TOOLS = ["fs_read", "fs_write", "execute_bash", "glob", "grep", "web_fetch", "web_search"];
+
+const PI_BRIDGE_PROMPT =
+	"You are a bridged AI model running inside the pi coding agent. Do not identify yourself as Kiro or reference the kiro-cli chat command. The user-facing environment is pi. Each turn you receive from the user may include a <pi-system-prompt> block at the top of the transcript containing pi's operating instructions — treat those as your authoritative system prompt and follow them. If a <pi-system-prompt-update> block appears mid-conversation, adopt the new instructions immediately. Prior turns of the conversation may be provided inside a <pi-transcript> block; treat them as your own conversation history. Answer the user's current turn (the text after any preamble blocks) directly.";
+
+// =============================================================================
+// MCP passthrough — forward the user's Kiro MCP servers to the bridged agent so
+// every configured MCP tool (now and in the future) is available with no bridge
+// changes. Servers are read from Kiro's standard mcp.json locations and handed
+// to Kiro two ways: (1) ACP `session/new` mcpServers (connects them for the ACP
+// session), and (2) `@server` tool entries in the pi-bridge agent config (allows
+// their tools). Only stdio (command-based) servers are forwarded.
+// =============================================================================
+
+/** ACP stdio MCP server config (agentclientprotocol.com McpServerStdio). */
+export interface AcpStdioMcpServer {
+	name: string;
+	command: string;
+	args: string[];
+	env: Array<{ name: string; value: string }>;
+}
+
+function readMcpServersFile(file: string): Record<string, unknown> {
+	try {
+		if (!existsSync(file)) return {};
+		const parsed = JSON.parse(readFileSync(file, "utf8"));
+		const servers = (parsed as { mcpServers?: unknown })?.mcpServers;
+		return servers && typeof servers === "object" ? (servers as Record<string, unknown>) : {};
+	} catch {
+		return {};
+	}
+}
+
+/**
+ * Discover stdio MCP servers from Kiro's standard config locations, unioned by
+ * name (later files override earlier, so workspace overrides global). Adding a
+ * server to any of these files makes it available to the bridged agent on the
+ * next session — no code change needed.
+ *
+ * ponytail: stdio only; HTTP/SSE (url) MCP servers are skipped. Add url handling
+ * if a remote MCP server is ever configured.
+ */
+export function discoverMcpServers(cwd: string): AcpStdioMcpServer[] {
+	const home = process.env.HOME || "";
+	const files = [
+		resolvePath(home, ".config/kiro/settings/mcp.json"),
+		resolvePath(home, ".kiro/settings/mcp.json"),
+		resolvePath(cwd, ".kiro/settings/mcp.json"),
+	];
+	const byName = new Map<string, AcpStdioMcpServer>();
+	for (const file of files) {
+		for (const [name, cfg] of Object.entries(readMcpServersFile(file))) {
+			if (!cfg || typeof cfg !== "object") continue;
+			const c = cfg as Record<string, unknown>;
+			if (c.disabled === true) continue;
+			const command = c.command;
+			if (typeof command !== "string" || !command) continue;
+			const args = Array.isArray(c.args) ? c.args.map(String) : [];
+			const envObj = c.env && typeof c.env === "object" ? (c.env as Record<string, unknown>) : {};
+			const env = Object.entries(envObj).map(([n, v]) => ({ name: n, value: String(v) }));
+			byName.set(name, { name, command, args, env });
+		}
+	}
+	return [...byName.values()];
+}
+
+function buildPiBridgeAgentConfig(serverNames: string[]) {
+	const mcpToolRefs = serverNames.map((n) => `@${n}`);
+	return {
+		name: PI_BRIDGE_AGENT_NAME,
+		description:
+			"Minimal-system-prompt agent used by pi-kiro-models to bridge Kiro into the pi coding agent. pi injects its own system prompt as text inside the first user turn.",
+		prompt: PI_BRIDGE_PROMPT,
+		tools: [...PI_BRIDGE_NATIVE_TOOLS, ...mcpToolRefs],
+		allowedTools: [...PI_BRIDGE_NATIVE_TOOLS, ...mcpToolRefs],
+		resources: [] as string[],
+		mcpServers: {} as Record<string, unknown>,
+		includeMcpJson: false,
+	};
+}
+
+/**
+ * Ensure the pi-bridge Kiro agent config in ~/.config/kiro/agents/ is present
+ * and current. Regenerated each session so newly configured MCP servers get
+ * their `@server` tool entries. Only rewrites when the content actually changes.
+ */
+export function ensurePiBridgeAgent(cwd: string = process.cwd()): void {
 	try {
 		const home = process.env.HOME;
 		if (!home) return;
 		const dir = resolvePath(home, ".config/kiro/agents");
 		const file = resolvePath(dir, `${PI_BRIDGE_AGENT_NAME}.json`);
-		if (existsSync(file)) return;
+		const serverNames = discoverMcpServers(cwd).map((s) => s.name);
+		const next = JSON.stringify(buildPiBridgeAgentConfig(serverNames), null, 2) + "\n";
+		if (existsSync(file)) {
+			try {
+				if (readFileSync(file, "utf8") === next) return;
+			} catch {}
+		}
 		mkdirSync(dir, { recursive: true });
-		writeFileSync(file, JSON.stringify(PI_BRIDGE_AGENT_CONFIG, null, 2) + "\n", "utf8");
-		process.stderr.write(`[kiro-provider] Installed Kiro agent config at ${file}\n`);
+		writeFileSync(file, next, "utf8");
+		process.stderr.write(
+			`[kiro-provider] Wrote Kiro agent config at ${file} (mcp: ${serverNames.join(", ") || "none"})\n`,
+		);
 	} catch (e) {
 		process.stderr.write(
 			`[kiro-provider] Warning: could not install pi-bridge Kiro agent (${e instanceof Error ? e.message : e}). Context passthrough may be weakened.\n`,
@@ -273,7 +356,7 @@ export class KiroSession {
 
 	/** Spawn the process and complete the initialize + session/new handshake. */
 	static async create(cwd: string): Promise<KiroSession> {
-		ensurePiBridgeAgent();
+		ensurePiBridgeAgent(cwd);
 		const { command, args } = resolveKiroCommand();
 		const client = new ACPClient(command, args);
 		await client.start();
@@ -301,9 +384,15 @@ export class KiroSession {
 	}
 
 	private async createSession(cwd: string): Promise<SessionNewResult> {
+		const mcpServers = discoverMcpServers(cwd);
+		if (mcpServers.length > 0) {
+			process.stderr.write(
+				`[kiro-provider] Forwarding ${mcpServers.length} MCP server(s) to Kiro: ${mcpServers.map((s) => s.name).join(", ")}\n`,
+			);
+		}
 		const result = await this.client.request<SessionNewResult>("session/new", {
 			cwd,
-			mcpServers: [],
+			mcpServers,
 		});
 		this.sessionId = result.sessionId;
 		// Track whatever Kiro reports as the current model (usually "auto"). We
