@@ -728,35 +728,70 @@ export function streamKiro(
 }
 
 // =============================================================================
-// Models — all 15 Kiro models registered as a flat list.
+// Models — dynamically fetched from kiro-cli at startup
 // Costs are 0 because Kiro uses credit-based subscription pricing, not $/token.
 // =============================================================================
 
 const ZERO_COST = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } as const;
 
-const kiroModels: Array<{ id: string; name: string; contextWindow: number; maxTokens: number; reasoning: boolean }> = [
-	{ id: "auto", name: "Auto", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-sonnet-5", name: "Claude Sonnet 5 (Experimental)", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-opus-4.8", name: "Claude Opus 4.8", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-opus-4.7", name: "Claude Opus 4.7", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-opus-4.6", name: "Claude Opus 4.6", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-sonnet-4.6", name: "Claude Sonnet 4.6", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-opus-4.5", name: "Claude Opus 4.5", contextWindow: 200_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", contextWindow: 200_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-sonnet-4", name: "Claude Sonnet 4", contextWindow: 200_000, maxTokens: 8192, reasoning: false },
-	{ id: "claude-haiku-4.5", name: "Claude Haiku 4.5", contextWindow: 200_000, maxTokens: 8192, reasoning: false },
-	{ id: "deepseek-3.2", name: "DeepSeek V3.2 (Experimental)", contextWindow: 164_000, maxTokens: 8192, reasoning: false },
-	{ id: "minimax-m2.5", name: "MiniMax M2.5", contextWindow: 196_000, maxTokens: 8192, reasoning: false },
-	{ id: "minimax-m2.1", name: "MiniMax M2.1 (Experimental)", contextWindow: 196_000, maxTokens: 8192, reasoning: false },
-	{ id: "glm-5", name: "GLM-5", contextWindow: 200_000, maxTokens: 8192, reasoning: false },
-	{ id: "qwen3-coder-next", name: "Qwen3 Coder Next (Experimental)", contextWindow: 256_000, maxTokens: 8192, reasoning: false },
-];
+interface KiroModelInfo {
+	model_id: string;
+	model_name: string;
+	description: string;
+	context_window_tokens: number;
+	rate_multiplier: number;
+}
+
+interface KiroModelsResponse {
+	models: KiroModelInfo[];
+	default_model: string;
+}
+
+/**
+ * Fetch available models from kiro-cli. Falls back to a minimal safe set if
+ * the CLI is unreachable or the command fails (e.g., not logged in).
+ */
+async function fetchKiroModels(): Promise<Array<{ id: string; name: string; contextWindow: number; maxTokens: number; reasoning: boolean }>> {
+	try {
+		const { execFile } = await import("node:child_process");
+		const { promisify } = await import("node:util");
+		const execFileAsync = promisify(execFile);
+
+		const { stdout } = await execFileAsync("kiro-cli", ["chat", "--list-models", "--format", "json"], {
+			timeout: 5000,
+			maxBuffer: 1024 * 1024,
+		});
+
+		const parsed: KiroModelsResponse = JSON.parse(stdout);
+		return parsed.models.map((m) => ({
+			id: m.model_id,
+			name: m.model_name,
+			contextWindow: m.context_window_tokens,
+			maxTokens: 8192, // Safe default; Kiro doesn't expose max_output_tokens in --list-models
+			// Reasoning models: opus/sonnet families with deep thinking; haiku/glm/minimax are fast utility models
+			reasoning: m.model_id.includes("opus") || m.model_id.includes("sonnet") || m.model_id.includes("gpt"),
+		}));
+	} catch (e) {
+		process.stderr.write(
+			`[kiro-provider] Warning: could not fetch models from kiro-cli (${e instanceof Error ? e.message : e}). Using fallback list.\n`,
+		);
+		// Fallback: minimal safe set so the provider still registers
+		return [
+			{ id: "auto", name: "Auto", contextWindow: 1_000_000, maxTokens: 8192, reasoning: false },
+			{ id: "claude-sonnet-4.5", name: "Claude Sonnet 4.5", contextWindow: 200_000, maxTokens: 8192, reasoning: true },
+			{ id: "claude-sonnet-4", name: "Claude Sonnet 4", contextWindow: 200_000, maxTokens: 8192, reasoning: true },
+		];
+	}
+}
 
 // =============================================================================
-// Extension entry point
+// Extension entry point — async to fetch models dynamically
 // =============================================================================
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
+	const kiroModels = await fetchKiroModels();
+	process.stderr.write(`[kiro-provider] Registered ${kiroModels.length} model(s) from kiro-cli\n`);
+
 	pi.registerProvider("kiro", {
 		name: "Kiro (via ACP)",
 		api: "kiro-acp",

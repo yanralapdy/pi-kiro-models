@@ -1,7 +1,7 @@
 {
   "name": "pi-kiro-models",
   "description": "Bridge Kiro CLI's 15 premium AI models into the pi coding agent via Agent Client Protocol (ACP), with dynamic MCP tool passthrough.",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "type": "module",
   "license": "MIT",
   "author": "yanralapdy",
