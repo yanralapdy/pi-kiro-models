@@ -763,14 +763,36 @@ async function fetchKiroModels(): Promise<Array<{ id: string; name: string; cont
 		});
 
 		const parsed: KiroModelsResponse = JSON.parse(stdout);
-		return parsed.models.map((m) => ({
-			id: m.model_id,
-			name: m.model_name,
-			contextWindow: m.context_window_tokens,
-			maxTokens: 8192, // Safe default; Kiro doesn't expose max_output_tokens in --list-models
-			// Reasoning models: opus/sonnet families with deep thinking; haiku/glm/minimax are fast utility models
-			reasoning: m.model_id.includes("opus") || m.model_id.includes("sonnet") || m.model_id.includes("gpt"),
-		}));
+		return parsed.models.map((m) => {
+			let maxTokens = 8192; // Safe default; Kiro doesn't expose max_output_tokens in --list-models
+
+			if (m.model_id.includes("gemini-3.1-pro")) {
+				maxTokens = 65536;
+			} else if (m.model_id.includes("gemini") && m.model_id.includes("thinking")) {
+				maxTokens = 32768;
+			} else if (m.model_id.includes("qwen-3.7-max")) {
+				maxTokens = 32768;
+			} else if (m.model_id.includes("mimo-v2.5-pro") || m.model_id.includes("mimo")) {
+				maxTokens = 1000000;
+			} else if (m.model_id.includes("gpt-5.6")) {
+				maxTokens = 128000;
+			} else if (m.model_id.includes("gpt-5") && !m.model_id.includes("gpt-5.6")) {
+				maxTokens = 32768;
+			} else if (m.model_id.includes("o1") || m.model_id.includes("o3")) {
+				maxTokens = 100000;
+			} else if (m.model_id.includes("deepseek")) {
+				maxTokens = 32768;
+			}
+
+			return {
+				id: m.model_id,
+				name: m.model_name,
+				contextWindow: m.context_window_tokens,
+				maxTokens, 
+				// Reasoning models: opus/sonnet families with deep thinking; haiku/glm/minimax are fast utility models
+				reasoning: m.model_id.includes("opus") || m.model_id.includes("sonnet") || m.model_id.includes("gpt"),
+			};
+		});
 	} catch (e) {
 		process.stderr.write(
 			`[kiro-provider] Warning: could not fetch models from kiro-cli (${e instanceof Error ? e.message : e}). Using fallback list.\n`,
