@@ -21,6 +21,13 @@ import type {
 } from "@earendil-works/pi-ai";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { startToolBridge, type ToolBridge, type ToolBridgeCall, type ToolBridgeResult } from "./tool-bridge.ts";
+import { buildForwardedToolCatalog, type ForwardedToolCatalog } from "./tool-catalog.ts";
+import { KiroToolCoordinator } from "./tool-coordinator.ts";
+
+export * from "./tool-catalog.ts";
+export * from "./tool-bridge.ts";
+export * from "./tool-coordinator.ts";
 
 process.stderr.write("[kiro-provider] Extension loaded\n");
 
@@ -63,6 +70,7 @@ export class ACPClient {
 	private onMessage: MessageHandler | null = null;
 	private onNotification: ((msg: JsonRpcNotification) => void) | null = null;
 	private onStderr: ((line: string) => void) | null = null;
+	private onExit: (() => void) | null = null;
 	private readline: ReturnType<typeof createInterface> | null = null;
 	private readyPromise: Promise<void> | null = null;
 
@@ -87,6 +95,9 @@ export class ACPClient {
 			for (const { reject } of this.pending.values()) reject(err);
 			this.pending.clear();
 			this.proc = null;
+			const onExit = this.onExit;
+			this.onExit = null;
+			onExit?.();
 			// Reset shared session so the next prompt respawns
 			sharedSession = null;
 		});
@@ -94,6 +105,9 @@ export class ACPClient {
 		this.proc.on("error", (err) => {
 			for (const { reject } of this.pending.values()) reject(err);
 			this.pending.clear();
+			const onExit = this.onExit;
+			this.onExit = null;
+			onExit?.();
 			sharedSession = null;
 		});
 
@@ -130,6 +144,11 @@ export class ACPClient {
 	/** Register a handler for stderr lines. */
 	setStderrHandler(handler: ((line: string) => void) | null): void {
 		this.onStderr = handler;
+	}
+
+	/** Register a handler for child-process exit/error cleanup. */
+	setExitHandler(handler: (() => void) | null): void {
+		this.onExit = handler;
 	}
 
 	/** Stop the child process. */
@@ -234,6 +253,16 @@ export interface AcpStdioMcpServer {
 	args: string[];
 	env: Array<{ name: string; value: string }>;
 }
+
+/** ACP HTTP MCP server config used for host-executed Pi extension tools. */
+export interface AcpHttpMcpServer {
+	type: "http";
+	name: string;
+	url: string;
+	headers: Array<{ name: string; value: string }>;
+}
+
+type AcpMcpServer = AcpStdioMcpServer | AcpHttpMcpServer;
 
 function readMcpServersFile(file: string): Record<string, unknown> {
 	try {
@@ -340,8 +369,16 @@ interface SessionNewResult {
 	models?: unknown;
 }
 
+export interface KiroToolRuntime {
+	getCatalog(): ForwardedToolCatalog;
+}
+
 export class KiroSession {
 	readonly client: ACPClient;
+	readonly coordinator = new KiroToolCoordinator();
+	readonly runtime?: KiroToolRuntime;
+	readonly catalogFingerprint: string | undefined;
+	toolBridge: ToolBridge | null = null;
 	sessionId: string | null = null;
 	/** Number of pi messages already forwarded to Kiro. Used for delta-send. */
 	lastMessageCount = 0;
@@ -349,27 +386,49 @@ export class KiroSession {
 	lastSystemPrompt: string | undefined = undefined;
 	/** Kiro model id currently selected via session/set_model. */
 	currentModelId: string | null = null;
+	private activePrompt: Promise<{ stopReason: string }> | null = null;
 
-	constructor(client: ACPClient) {
+	constructor(client: ACPClient, runtime?: KiroToolRuntime) {
 		this.client = client;
+		this.runtime = runtime;
+		this.catalogFingerprint = runtime?.getCatalog().fingerprint;
+		client.setExitHandler(() => {
+			this.coordinator.rejectPending(new Error("ACP process exited"));
+			const bridge = this.toolBridge;
+			this.toolBridge = null;
+			if (bridge) void bridge.close().catch(() => {});
+		});
 	}
 
 	/** Spawn the process and complete the initialize + session/new handshake. */
-	static async create(cwd: string): Promise<KiroSession> {
+	static async create(cwd: string, runtime?: KiroToolRuntime): Promise<KiroSession> {
 		ensurePiBridgeAgent(cwd);
 		const { command, args } = resolveKiroCommand();
 		const client = new ACPClient(command, args);
 		await client.start();
-		const session = new KiroSession(client);
+		const session = new KiroSession(client, runtime);
+		if (runtime) {
+			const catalog = runtime.getCatalog();
+			process.stderr.write(`[kiro-provider] Host tool bridge starting (${catalog.tools.length} tool(s))\n`);
+			session.toolBridge = await startToolBridge({
+				catalog,
+				onToolCall: (call) => session.handleToolCall(call),
+			});
+		}
 
 		// Drain session/update notifications (Kiro sends many during startup) so the
 		// readline buffer doesn't fill up. We don't act on them here; the streamSimple
 		// handler will process them per-prompt.
 		client.setNotificationHandler(() => {});
 
-		await session.initialize();
-		await session.createSession(cwd);
-		return session;
+		try {
+			await session.initialize();
+			await session.createSession(cwd);
+			return session;
+		} catch (error) {
+			await session.stop();
+			throw error;
+		}
 	}
 
 	private async initialize(): Promise<InitializeResult> {
@@ -384,7 +443,15 @@ export class KiroSession {
 	}
 
 	private async createSession(cwd: string): Promise<SessionNewResult> {
-		const mcpServers = discoverMcpServers(cwd);
+		const mcpServers: AcpMcpServer[] = discoverMcpServers(cwd);
+		if (this.toolBridge) {
+			mcpServers.push({
+				type: "http",
+				name: "pi_host",
+				url: this.toolBridge.url,
+				headers: [{ name: "Authorization", value: `Bearer ${this.toolBridge.token}` }],
+			});
+		}
 		if (mcpServers.length > 0) {
 			process.stderr.write(
 				`[kiro-provider] Forwarding ${mcpServers.length} MCP server(s) to Kiro: ${mcpServers.map((s) => s.name).join(", ")}\n`,
@@ -419,7 +486,55 @@ export class KiroSession {
 		}
 	}
 
+	async handleToolCall(call: ToolBridgeCall): Promise<ToolBridgeResult> {
+		return this.coordinator.beginCall(call);
+	}
+
+	beginPrompt(request: () => Promise<{ stopReason: string }>): Promise<{ stopReason: string }> {
+		this.coordinator.startPrompt();
+		const prompt = Promise.resolve().then(request);
+		this.activePrompt = prompt;
+		void prompt.then(
+			() => this.finishPrompt(prompt),
+			() => this.finishPrompt(prompt),
+		);
+		return prompt;
+	}
+
+	finishPrompt(prompt: Promise<{ stopReason: string }>): void {
+		if (this.activePrompt !== prompt) return;
+		this.activePrompt = null;
+		this.coordinator.finishPrompt();
+	}
+
+	get promptPromise(): Promise<{ stopReason: string }> | null {
+		return this.activePrompt;
+	}
+
+	waitForForwardedCall() {
+		return this.coordinator.waitForHandoff();
+	}
+
+	get pendingForwardedCall() {
+		return this.coordinator.pendingCall;
+	}
+
+	resolveToolResult(message: ToolResultMessage): boolean {
+		return this.coordinator.resolveToolResult(
+			message.toolCallId,
+			message.toolName,
+			{
+				content: [{ type: "text", text: stringifyUserOrToolContent(message.content) }],
+				...(message.isError ? { isError: true } : {}),
+			},
+		);
+	}
+
 	async stop(): Promise<void> {
+		this.coordinator.rejectPending(new Error("Kiro session stopped"));
+		const bridge = this.toolBridge;
+		this.toolBridge = null;
+		if (bridge) await bridge.close().catch(() => {});
 		await this.client.stop();
 		sharedSession = null;
 	}
@@ -583,13 +698,27 @@ export function buildPromptFromContext(
 /** Shared session across all streamSimple calls in this pi process. */
 let sharedSession: Promise<KiroSession> | null = null;
 
-export function getSession(cwd: string): Promise<KiroSession> {
+function createSharedSession(cwd: string, runtime?: KiroToolRuntime): Promise<KiroSession> {
+	return KiroSession.create(cwd, runtime);
+}
+
+export function getSession(cwd: string, runtime?: KiroToolRuntime): Promise<KiroSession> {
 	if (!sharedSession) {
-		sharedSession = KiroSession.create(cwd).catch((e) => {
-			sharedSession = null; // allow retry on next call
-			throw e;
-		});
+		sharedSession = createSharedSession(cwd, runtime);
 	}
+	if (!runtime) return sharedSession;
+
+	sharedSession = sharedSession.then(async (session) => {
+		const nextFingerprint = runtime.getCatalog().fingerprint;
+		const changed = session.runtime !== runtime || session.catalogFingerprint !== nextFingerprint;
+		if (!changed || session.promptPromise || session.pendingForwardedCall) return session;
+		process.stderr.write("[kiro-provider] Host tool catalog changed; recreating internal Kiro session\n");
+		await session.stop();
+		return createSharedSession(cwd, runtime);
+	}).catch((error) => {
+		sharedSession = null;
+		throw error;
+	});
 	return sharedSession;
 }
 
@@ -613,6 +742,7 @@ export function streamKiro(
 	model: Model<any>,
 	context: Context,
 	options?: SimpleStreamOptions,
+	runtime?: KiroToolRuntime,
 ): AssistantMessageEventStream {
 	const stream = createAssistantMessageEventStream();
 
@@ -634,86 +764,131 @@ export function streamKiro(
 			stopReason: "stop",
 			timestamp: Date.now(),
 		};
+		let textClosed = false;
+		const closeText = () => {
+			if (textClosed) return;
+			if (output.content.length > 0 && output.content[0].type === "text") {
+				stream.push({ type: "text_end", contentIndex: 0, content: (output.content[0] as TextContent).text, partial: output });
+			}
+			textClosed = true;
+		};
+		const emitForwardedCall = (call: import("./tool-coordinator.ts").ForwardedCall) => {
+			closeText();
+			const toolCall: ToolCall = {
+				type: "toolCall",
+				id: call.piToolCallId,
+				name: call.piName,
+				arguments: call.arguments,
+			};
+			const contentIndex = output.content.length;
+			output.content.push(toolCall);
+			stream.push({ type: "toolcall_start", contentIndex, partial: output });
+			stream.push({ type: "toolcall_delta", contentIndex, delta: JSON.stringify(call.arguments), partial: output });
+			stream.push({ type: "toolcall_end", contentIndex, toolCall, partial: output });
+			output.stopReason = "toolUse";
+			stream.push({ type: "done", reason: "toolUse", message: output });
+			stream.end();
+		};
+		let cleanupAbort = () => {};
 
 		try {
 			stream.push({ type: "start", partial: output });
-
-			const session = await getSession(context.cwd || process.cwd());
-			// Route to the pi-selected model. No-op if already active.
+			const session = await getSession(context.cwd || process.cwd(), runtime);
 			await session.ensureModel(model.id);
 
-			let built: BuiltPrompt;
-			try {
-				built = buildPromptFromContext(
-					context,
-					session.lastMessageCount,
-					session.lastSystemPrompt,
-				);
-			} catch (e) {
-				throw e instanceof Error ? e : new Error(String(e));
+			const tail = context.messages[context.messages.length - 1];
+			let resumed = false;
+			if (session.pendingForwardedCall && tail?.role === "toolResult") {
+				resumed = session.resolveToolResult(tail);
+				if (!resumed) throw new Error("Tool result does not match the pending Kiro call");
 			}
-			const text = built.text;
 
-			// Set up notification handler to push text deltas
-			const onAbort = () => { /* signal aborted is checked below */ };
-			options?.signal?.addEventListener("abort", onAbort);
+			let built: BuiltPrompt | undefined;
+			let promptPromise: Promise<{ stopReason: string }>;
+			if (resumed) {
+				promptPromise = session.promptPromise || Promise.reject(new Error("No suspended Kiro prompt"));
+			} else {
+				built = buildPromptFromContext(context, session.lastMessageCount, session.lastSystemPrompt);
+				promptPromise = session.beginPrompt(() => session.client.request<{ stopReason: string }>("session/prompt", {
+					sessionId: session.sessionId,
+					prompt: [{ type: "text", text: built!.text }],
+				}));
+			}
 
-			// Collect session/update notifications into the output
+			// Collect text notifications for either a fresh or resumed Kiro prompt.
 			session.client.setNotificationHandler((notif) => {
 				if (notif.method !== "session/update") return;
 				const params = notif.params as { sessionId: string; update: any } | undefined;
 				if (!params || params.sessionId !== session.sessionId) return;
 				const update = params.update;
-				if (update?.sessionUpdate === "agent_message_chunk") {
-					const content = update.content;
-					if (content?.type === "text" && content.text) {
-						const delta = content.text;
-						if (output.content.length === 0 || output.content[0].type !== "text") {
-							output.content.unshift({ type: "text", text: "" });
-						}
-						(output.content[0] as TextContent).text += delta;
-						stream.push({ type: "text_delta", contentIndex: 0, delta, partial: output });
-					}
+				if (update?.sessionUpdate !== "agent_message_chunk") return;
+				const content = update.content;
+				if (content?.type !== "text" || !content.text) return;
+				const delta = content.text;
+				if (output.content.length === 0 || output.content[0].type !== "text") {
+					output.content.unshift({ type: "text", text: "" });
 				}
+				(output.content[0] as TextContent).text += delta;
+				stream.push({ type: "text_delta", contentIndex: 0, delta, partial: output });
 			});
 
-			// Send the prompt and wait for the response (which has stopReason)
-			const promptPromise = session.client.request<{ stopReason: string }>("session/prompt", {
-				sessionId: session.sessionId,
-				prompt: [{ type: "text", text }],
-			});
-
-			// If aborted before prompt completes, send session/cancel
-			const abortHandler = async () => {
+			const abortHandler = () => {
 				if (!options?.signal?.aborted) return;
-				try {
-					session.client.notify("session/cancel", { sessionId: session.sessionId });
-				} catch {}
+				session.coordinator.rejectPending(new Error("Kiro tool call aborted"));
+				try { session.client.notify("session/cancel", { sessionId: session.sessionId }); } catch {}
 			};
-			options?.signal?.addEventListener("abort", abortHandler);
+			let resolveAbort!: () => void;
+			let abortEventHandler: (() => void) | undefined;
+			const abortPromise = options?.signal
+				? new Promise<void>((resolve) => {
+					resolveAbort = resolve;
+					if (options.signal!.aborted) resolve();
+					else {
+						abortEventHandler = () => { abortHandler(); resolve(); };
+						options.signal!.addEventListener("abort", abortEventHandler, { once: true });
+						cleanupAbort = () => options.signal!.removeEventListener("abort", abortEventHandler!);
+					}
+				})
+				: new Promise<void>(() => {});
+			if (options?.signal?.aborted) abortHandler();
 
-			const result = await promptPromise;
-			// Kiro has processed the turn (success or cancel). Record what we sent
-			// so the next call only forwards the delta.
-			session.lastMessageCount = built.newMessageCount;
-			session.lastSystemPrompt = built.systemPromptForwarded;
-			const wasAborted = options?.signal?.aborted;
-			if (wasAborted || result.stopReason === "cancelled") {
+			const race = await Promise.race([
+				promptPromise.then((result) => ({ kind: "prompt" as const, result })),
+				session.waitForForwardedCall().then((call) => ({ kind: "handoff" as const, call })),
+				abortPromise.then(() => ({ kind: "aborted" as const })),
+			]);
+			if (race.kind === "aborted") {
+				resolveAbort?.();
 				output.stopReason = "aborted";
-				if (output.content.length > 0 && output.content[0].type === "text") {
-					stream.push({ type: "text_end", contentIndex: 0, content: (output.content[0] as TextContent).text, partial: output });
-				}
+				closeText();
+				stream.push({ type: "error", reason: "aborted", error: output });
+				stream.end();
+				return;
+			}
+			if (options?.signal?.aborted) {
+				abortHandler();
+				throw new Error("aborted");
+			}
+			if (race.kind === "handoff") {
+				session.lastMessageCount = resumed ? context.messages.length : built!.newMessageCount;
+				session.lastSystemPrompt = context.systemPrompt;
+				emitForwardedCall(race.call);
+				return;
+			}
+
+			const result = race.result;
+			// Kiro has processed the turn (success or cancel). Record what we sent.
+			session.lastMessageCount = resumed ? context.messages.length : built!.newMessageCount;
+			session.lastSystemPrompt = context.systemPrompt;
+			if (options?.signal?.aborted || result.stopReason === "cancelled") {
+				output.stopReason = "aborted";
+				closeText();
 				stream.push({ type: "error", reason: "aborted", error: output });
 				stream.end();
 				return;
 			}
 			output.stopReason = result.stopReason === "toolUse" ? "toolUse" : "stop";
-
-			// Close the text block
-			if (output.content.length > 0 && output.content[0].type === "text") {
-				stream.push({ type: "text_end", contentIndex: 0, content: (output.content[0] as TextContent).text, partial: output });
-			}
-
+			closeText();
 			stream.push({ type: "done", reason: output.stopReason as "stop" | "length" | "toolUse", message: output });
 			stream.end();
 		} catch (error) {
@@ -721,6 +896,8 @@ export function streamKiro(
 			output.errorMessage = error instanceof Error ? error.message : String(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			cleanupAbort();
 		}
 	})();
 
@@ -813,6 +990,9 @@ async function fetchKiroModels(): Promise<Array<{ id: string; name: string; cont
 export default async function (pi: ExtensionAPI) {
 	const kiroModels = await fetchKiroModels();
 	process.stderr.write(`[kiro-provider] Registered ${kiroModels.length} model(s) from kiro-cli\n`);
+	const runtime: KiroToolRuntime = {
+		getCatalog: () => buildForwardedToolCatalog(pi.getAllTools(), pi.getActiveTools()),
+	};
 
 	pi.registerProvider("kiro", {
 		name: "Kiro (via ACP)",
@@ -828,6 +1008,6 @@ export default async function (pi: ExtensionAPI) {
 			contextWindow: m.contextWindow,
 			maxTokens: m.maxTokens,
 		})),
-		streamSimple: streamKiro,
+		streamSimple: (model, context, options) => streamKiro(model, context, options, runtime),
 	});
 }

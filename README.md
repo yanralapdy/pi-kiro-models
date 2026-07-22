@@ -17,24 +17,32 @@ Bridge Kiro CLI's premium AI models into the [pi coding agent](https://github.co
 ### How it works
 
 ```
-pi TUI  →  Extension (streamSimple)  →  ACP Client (NDJSON over stdio)  →  kiro-cli-chat acp --agent pi-bridge  →  Kiro API
+pi outer loop
+  │ streamSimple + active extension catalog
+  ├── loopback HTTP MCP (pi_host) ──► Kiro inner loop
+  │                                  │ tools/call
+  │                                  ▼
+  └──── normal Pi tool call ◄── host handoff ──┘
 ```
 
-1. pi loads the extension, which registers a `kiro` provider with 15 models.
-2. On the first prompt, the extension writes a `pi-bridge` Kiro agent config to `~/.config/kiro/agents/pi-bridge.json` (idempotent) and spawns `kiro-cli-chat acp --agent pi-bridge` as a child process. It completes the ACP handshake (`initialize` + `session/new`), then issues `session/set_model` for the pi-selected model.
-3. For each prompt, the extension renders pi's `systemPrompt` and any new turns in `context.messages` into a tagged transcript and sends only the delta as `session/prompt`. Kiro's own session state persists prior turns.
-4. Kiro streams `agent_message_chunk` notifications, which the extension maps to pi's `text_delta` events.
+1. pi loads the extension, which registers a `kiro` provider with the live model catalog.
+2. On the first prompt, the extension writes the `pi-bridge` Kiro agent config, starts an authenticated `127.0.0.1` HTTP MCP adapter, and spawns `kiro-cli-chat acp`. The ACP `session/new` request retains configured stdio MCP servers and adds `pi_host`.
+3. Each independent turn rebuilds the active extension-tool catalog. Catalog changes recreate only the internal Kiro session and replay Pi context.
+4. Ordinary prompts render Pi's system prompt and transcript delta into `session/prompt`.
+5. When Kiro calls a forwarded tool, the adapter suspends its HTTP request; Pi receives the original tool name as a normal tool call and runs its existing validation, hooks, UI, and result persistence.
+6. The next Pi turn returns the recorded result to the waiting MCP request, so Kiro continues the original ACP prompt. Forwarded calls are serialized.
 
 ### Tools
 
-Inference for Kiro models runs inside **Kiro's own agent loop** — Kiro executes tool calls itself and streams back text. pi forwards the transcript and displays the result; pi does not execute tools on Kiro's behalf.
+Kiro still owns the inner agent loop, but forwarded extension calls execute through Pi's outer tool lifecycle. The bridged model sees three distinct tool classes:
 
-Two classes of tools are available to the bridged model:
+1. **Kiro native tools** — `fs_read`, `fs_write`, `execute_bash`, `glob`, `grep`, `web_fetch`, and `web_search`.
+2. **Configured Kiro MCP tools** — stdio servers from discovered `mcp.json` files remain direct Kiro MCP tools. See [MCP Tool Passthrough](#mcp-tool-passthrough).
+3. **Host-executed Pi extension tools** — active extension-contributed tools are published through the authenticated `pi_host` loopback MCP adapter. Kiro calls the adapter, Pi executes the original tool with its normal validation, hooks, UI, and session recording, then the result returns to Kiro.
 
-1. **Kiro's native tools** — `fs_read`, `fs_write`, `execute_bash`, `glob`, `grep`, `web_fetch`, `web_search`.
-2. **MCP servers you've configured** — the bridge discovers every MCP server in your Kiro `mcp.json` files and forwards them to the session, so their tools are callable directly by the model. See [MCP Tool Passthrough](#mcp-tool-passthrough).
+Pi built-in coding tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls`) are intentionally excluded because Kiro already provides native equivalents. Forwarded calls are serialized. A blocked or failed Pi tool is returned to Kiro as an MCP error rather than a false success. Tool names that Kiro rejects receive deterministic aliases.
 
-> **Why not forward pi's own tools?** pi's `ExtensionAPI` exposes tool *definitions* (`getAllTools()`) but no way for one extension to *execute* another's tool, and Kiro — not pi — drives the agent loop for Kiro models. So pi's in-process tools (`read`/`edit`/etc.) can't be handed to Kiro generically. The forwardable, future-proof surface is **MCP**, which Kiro runs natively. Any tool you want available to a Kiro model should be exposed as an MCP server.
+See [ADR 0001](docs/adr/0001-bridge-active-pi-extension-tools-through-host-execution.md) for the architecture decision.
 
 ---
 
@@ -42,6 +50,7 @@ Two classes of tools are available to the bridged model:
 
 - **15 models** from Kiro's catalog — Claude Sonnet 5, Opus 4.8/4.7/4.6/4.5, Sonnet 4.6/4.5/4, Haiku 4.5, DeepSeek V3.2, GLM-5, Qwen3 Coder Next, and more
 - **Dynamic MCP tool passthrough** — every MCP server in your Kiro `mcp.json` is auto-forwarded to the bridged model. Add a server to `mcp.json`, restart pi, and its tools are callable — no bridge edits. See [MCP Tool Passthrough](#mcp-tool-passthrough).
+- **Host-executed Pi extension tools** — active extension tools are discovered each turn and called through the authenticated loopback `pi_host` adapter.
 - **Model routing via `session/set_model`** — pi's `/model` selection actually reaches Kiro (not just the `auto` default)
 - **Token-by-token streaming** into pi's TUI
 - **Full pi context passthrough** — `systemPrompt`, prior turns, tool calls, and tool results are rendered as a tagged transcript (`<pi-system-prompt>`, `<pi-transcript>`, `<user>`, `<assistant>`, `<tool_call>`, `<tool_result>`). Only the delta since the last send is forwarded per turn; Kiro's own session state persists prior turns.
@@ -59,47 +68,33 @@ Two classes of tools are available to the bridged model:
 | Language | TypeScript |
 | Protocol | Agent Client Protocol (ACP) over stdio |
 | Framing | NDJSON (newline-delimited JSON-RPC 2.0) |
-| Transport | Child process spawn with stdio pipes |
-| Authentication | Inherited from `kiro-cli` (IAM Identity Center) |
+| Transport | ACP NDJSON stdio plus authenticated loopback Streamable HTTP MCP |
+| Authentication | Kiro CLI auth plus per-session random bearer token for `pi_host` |
 
 ---
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ pi (host)                                                │
-│  ┌────────────────────────────────────────────────────┐  │
-│  │ kiro-provider extension (index.ts)                 │  │
-│  │  ┌──────────────┐  ┌─────────────────────────────┐  │  │
-│  │  │ 15 models    │  │ streamKiro() — bridges ACP  │  │  │
-│  │  │ registered   │  │ to pi's AssistantMessage    │  │  │
-│  │  └──────────────┘  │ EventStream                 │  │  │
-│  │                    └──────────────┬──────────────┘  │  │
-│  │  ┌─────────────────────────────────▼──────────────┐  │  │
-│  │  │ ACPClient (NDJSON, request/response,           │  │  │
-│  │  │ notification dispatch)                         │  │  │
-│  │  └─────────────────────────────────┬──────────────┘  │  │
-│  └────────────────────────────────────┼─────────────────┘  │
-└─────────────────────────────────────┼────────────────────┘
-                                      │ stdin/stdout (NDJSON)
-                                      │
-┌─────────────────────────────────────▼────────────────────┐
-│ kiro-cli-chat acp (child process)                        │
-│  - ACP session state                                     │
-│  - Built-in tool execution (read, write, shell, etc.)   │
-│  - IAM Identity Center auth                              │
-└──────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ pi outer loop                                               │
+│  streamKiro ── catalog + KiroToolCoordinator                │
+│       │                                                     │
+│       ├── 127.0.0.1:ephemeral /mcp (bearer token) ───────┐  │
+│       │                                                    │  │
+│       └── ACPClient NDJSON ── kiro-cli-chat acp             │  │
+│                                      Kiro inner loop ◄──────┘  │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 **Data flow per prompt:**
 
-1. pi calls `streamSimple(model, context, options)`
-2. Extension ensures the `pi-bridge` Kiro agent config exists at `~/.config/kiro/agents/pi-bridge.json` and spawns `kiro-cli-chat acp --agent pi-bridge` on the first call (cached across turns). It forwards every MCP server found in your Kiro `mcp.json` files via `session/new` `mcpServers`, so their tools are callable by the model.
-3. Extension issues `session/set_model` if pi's selected model differs from Kiro's current model.
-4. Extension renders `context.systemPrompt` and any new `context.messages` into a tagged transcript (`<pi-system-prompt>`, `<pi-transcript>`, `<user>`, `<assistant>`, `<tool_call>`, `<tool_result>`) and sends it as `session/prompt`. Only the delta since the previous send is included — Kiro maintains its own session history for prior turns.
-5. Kiro streams `session/update` notifications with `agent_message_chunk`.
-6. Extension maps each chunk to a `text_delta` event on pi's stream.
+1. pi calls `streamSimple(model, context, options)`.
+2. The extension discovers active extension metadata, excludes Pi built-ins, and starts/reuses the `pi_host` adapter plus Kiro ACP session.
+3. The session retains configured stdio MCP servers and adds the adapter as an HTTP MCP server.
+4. Text turns send only the transcript delta. A Kiro `tools/call` suspends its MCP HTTP response and emits a normal Pi `toolCall` event with the original Pi name.
+5. Pi executes the tool and appends its authoritative `ToolResultMessage`. The next provider invocation resolves the suspended MCP request without sending another ACP prompt.
+6. Kiro continues and streams `agent_message_chunk` notifications. Catalog changes recreate the disposable internal Kiro session before the next independent turn.
 7. Kiro responds to `session/prompt` with `stopReason: "end_turn"`.
 8. Extension pushes `done`, records `lastMessageCount` on the session, and ends the stream.
 
@@ -191,6 +186,19 @@ Start chatting. Text streams token-by-token. Ctrl+C cancels.
 
 ---
 
+## Host-executed Pi extension tools
+
+The bridge advertises active extension-contributed tools through a short-lived `pi_host` Streamable HTTP MCP server. The server binds only to `127.0.0.1`, uses an ephemeral port and random bearer token, and accepts Kiro's missing `Origin` header while rejecting supplied untrusted origins.
+
+On a forwarded call:
+
+1. Kiro sends `tools/call` to `pi_host`.
+2. Pi emits a normal `toolcall_start`/`toolcall_delta`/`toolcall_end` sequence using the original Pi name.
+3. Pi's regular loop validates and executes the tool, including existing blockers and hooks.
+4. The next Pi turn returns the recorded result to Kiro. Failures use MCP `isError: true`.
+
+Only active extension tools are exposed. Built-in Pi coding tools are excluded, aliases are deterministic for incompatible names, and calls are serialized in v1. A changed active catalog is applied by recreating the internal Kiro session on the next independent turn.
+
 ## MCP Tool Passthrough
 
 The bridge gives Kiro models access to [Model Context Protocol](https://modelcontextprotocol.io) servers. On each session it discovers the MCP servers configured for Kiro and forwards them two ways:
@@ -274,11 +282,20 @@ kiro-cli-chat chat --agent pi-bridge --no-interactive --trust-all-tools \
 Test scripts in `test/`:
 
 ```bash
-# NDJSON framing with a mock echo process
+# ACP framing with a mock echo process
 jiti test/framing.test.ts
 
-# ACP handshake with the real kiro-cli-chat binary
-jiti test/lifecycle.test.ts
+# Active extension catalog and aliases
+jiti test/catalog.test.ts
+
+# Authenticated loopback MCP adapter
+jiti test/tool-bridge.test.ts
+
+# Existing configured stdio MCP discovery regression
+jiti test/mcp-discovery.test.ts
+
+# Suspended Kiro-to-Pi handoff state machine
+jiti test/tool-coordinator.test.ts
 
 # Text streaming + Ctrl+C abort
 jiti test/stream.test.ts
@@ -287,10 +304,13 @@ jiti test/abort.test.ts
 # Respawn after external kill
 jiti test/lifecycle-cleanup.test.ts
 
-# Transcript rendering + delta-send prompt building (pure, no ACP)
+# Transcript rendering + delta-send prompt building
 jiti test/transcript.test.ts
 
-# End-to-end multi-turn passthrough with a real Kiro session
+# Authenticated Kiro HTTP MCP wire probe (requires Kiro auth)
+KIRO_HTTP_MCP_PROBE=1 jiti test/http-mcp-probe.test.ts
+
+# End-to-end multi-turn context passthrough (requires Kiro auth)
 jiti test/context.test.ts
 ```
 
@@ -318,14 +338,18 @@ Run with pi's bundled jiti:
 | pi's `systemPrompt` seems ignored | pi-bridge Kiro agent missing or stale | Delete `~/.config/kiro/agents/pi-bridge.json` and let the extension recreate it on the next run |
 | MCP tool not available to the model | Server not in a discovered `mcp.json`, is `disabled`, or is a `url` (HTTP/SSE) server | Add it to a [discovered `mcp.json`](#where-servers-are-read-from) as a stdio (`command`) server; check startup log for `Forwarding N MCP server(s)`; start a fresh session |
 | MCP server registered but tools still missing | Session started before the server was added | Restart pi — servers are forwarded at session creation |
+| Host extension tool is missing | Tool is inactive, built-in, or catalog refresh is pending | Confirm the extension is active; start a new independent turn and check the catalog-change diagnostic |
+| Forwarded call is blocked or fails | Pi's normal tool blocker/validation rejected it | Read the returned tool error; Kiro can recover, but the bridge never bypasses Pi policy |
+| Kiro cannot connect to `pi_host` | Adapter stopped with the ACP child or the session was replaced | Retry the turn; the bridge recreates the adapter with a new token and port |
 
 ---
 
 ## Roadmap
 
 - [x] V1: Chat-only bridge with all 15 models
-- [x] MCP tool passthrough — dynamically forward configured MCP servers to the bridged model (`session/new` `mcpServers` + generated `@server` agent config)
-- [ ] HTTP/SSE MCP server support (currently stdio only)
+- [x] MCP tool passthrough — dynamically forward configured stdio MCP servers to the bridged model
+- [x] Host-executed active Pi extension tools via authenticated loopback HTTP MCP
+- [ ] HTTP/SSE MCP servers in the user's `mcp.json` (the existing config reader remains stdio-only)
 - [ ] Multi-session support (concurrent pi processes)
 - [ ] Image input (Kiro ACP supports images; pi has ImageContent)
 
