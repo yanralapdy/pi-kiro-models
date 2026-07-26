@@ -217,7 +217,7 @@ export class ACPClient {
 /** Resolve the kiro-cli-chat binary path. */
 export function resolveKiroCommand(): { command: string; args: string[] } {
 	const command = process.env.KIRO_CLI_CHAT || resolvePath(process.env.HOME || "~", ".local/bin/kiro-cli-chat");
-	const args = ["acp", "--agent-engine", "v2", "--trust-all-tools", "--agent", "pi-bridge"];
+	const args = ["acp", "--agent-engine", "rust", "--trust-all-tools", "--agent", "pi-bridge"];
 	return { command, args };
 }
 

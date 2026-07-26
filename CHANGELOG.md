@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.4.1] - 2026-07-26
+
+### Fixed
+- Spawn `kiro-cli-chat acp` with `--agent-engine rust` instead of the removed `v2` value. Kiro CLI 2.3.0 rejects `v2` and exits immediately, so every bridged prompt failed with `ACP process exited with code 2`.
+
 ## [0.4.0] - 2026-07-21
 
 ### Added
