@@ -232,7 +232,11 @@ const PI_BRIDGE_AGENT_NAME = "pi-bridge";
 
 // Native Kiro tools the bridge always exposes. MCP tools are added dynamically
 // from the user's Kiro MCP config (see discoverMcpServers / buildPiBridgeAgentConfig).
-const PI_BRIDGE_NATIVE_TOOLS = ["fs_read", "fs_write", "execute_bash", "glob", "grep", "web_fetch", "web_search"];
+// Names must match kiro-cli's current *primary* tool names (see
+// https://kiro.dev/docs/reference/built-in-tools/). The old `fs_read`/`fs_write`/
+// `execute_bash` names are now aliases; `execute_bash` in particular no longer
+// surfaces the shell tool to the bridged model — it must be listed as `shell`.
+const PI_BRIDGE_NATIVE_TOOLS = ["read", "write", "shell", "glob", "grep", "web_fetch", "web_search"];
 
 const PI_BRIDGE_PROMPT =
 	"You are a bridged AI model running inside the pi coding agent. Do not identify yourself as Kiro or reference the kiro-cli chat command. The user-facing environment is pi. Each turn you receive from the user may include a <pi-system-prompt> block at the top of the transcript containing pi's operating instructions — treat those as your authoritative system prompt and follow them. If a <pi-system-prompt-update> block appears mid-conversation, adopt the new instructions immediately. Prior turns of the conversation may be provided inside a <pi-transcript> block; treat them as your own conversation history. Answer the user's current turn (the text after any preamble blocks) directly.";

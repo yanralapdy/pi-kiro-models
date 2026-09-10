@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.2] - 2026-09-10
+
+### Fixed
+- Bridged models now receive the `shell` tool again. The native tool list
+  requested `execute_bash`, the pre-rename kiro-cli name. Current kiro-cli
+  exposes the shell tool as `shell` (`execute_bash` is a legacy alias that no
+  longer surfaces the tool to the ACP `--agent` overlay), so the bridged model
+  silently lost shell access — it could read, write, glob, grep, and hit the
+  web, but could not run commands. `PI_BRIDGE_NATIVE_TOOLS` now uses kiro-cli's
+  current primary tool names: `read`, `write`, `shell`, `glob`, `grep`,
+  `web_fetch`, `web_search`.
+
+### Changed
+- Native tool entries `fs_read`/`fs_write` updated to their current primary
+  names `read`/`write` (behavior unchanged; the old names were aliases).
+
+### Notes
+- The generated `~/.config/kiro/agents/pi-bridge.json` is rewritten with the
+  corrected names on the next session start (or immediately, if already
+  updated). Restart pi to pick up the shell tool.
+
 ## [0.4.1] - 2026-07-26
 
 ### Fixed

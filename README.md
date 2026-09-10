@@ -36,7 +36,7 @@ pi outer loop
 
 Kiro still owns the inner agent loop, but forwarded extension calls execute through Pi's outer tool lifecycle. The bridged model sees three distinct tool classes:
 
-1. **Kiro native tools** — `fs_read`, `fs_write`, `execute_bash`, `glob`, `grep`, `web_fetch`, and `web_search`.
+1. **Kiro native tools** — `read`, `write`, `shell`, `glob`, `grep`, `web_fetch`, and `web_search`.
 2. **Configured Kiro MCP tools** — stdio servers from discovered `mcp.json` files remain direct Kiro MCP tools. See [MCP Tool Passthrough](#mcp-tool-passthrough).
 3. **Host-executed Pi extension tools** — active extension-contributed tools are published through the authenticated `pi_host` loopback MCP adapter. Kiro calls the adapter, Pi executes the original tool with its normal validation, hooks, UI, and session recording, then the result returns to Kiro.
 
